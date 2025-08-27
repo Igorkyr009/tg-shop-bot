@@ -70,11 +70,12 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 """
 
-async def db():
-    return await aiosqlite.connect(DB_PATH)
+def open_db():
+    return aiosqlite.connect(DB_PATH)  # возвращает контекст-менеджер
+
 
 async def init_db():
-    async with await db() as d:
+    async with open_db() as d:
         await d.executescript(CREATE_SQL)
         # seed products, если пусто
         cur = await d.execute("SELECT COUNT(*) FROM products")
@@ -91,12 +92,14 @@ async def init_db():
 
 # helpers settings
 async def set_setting(key:str, value:str):
-    async with await db() as d:
+    async with open_db() as d:
+
         await d.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         await d.commit()
 
 async def get_setting(key:str) -> Optional[str]:
-    async with await db() as d:
+    async with open_db() as d:
+
         cur = await d.execute("SELECT value FROM settings WHERE key=?", (key,))
         row = await cur.fetchone()
         return row[0] if row else None
@@ -140,7 +143,8 @@ async def on_webapp_data(m: Message):
         return await m.answer("Получены данные витрины, но тип неизвестен.")
 
     # подгрузим актуальные цены из БД
-    async with await db() as d:
+    async with open_db() as d:
+
         total = 0
         currency = "UAH"
         items_to_save: List[Tuple[str,str,int,int]] = []
@@ -238,7 +242,8 @@ if dp_admin:
 
     @dp_admin.message(Command("orders"))
     async def admin_orders(m: Message):
-        async with await db() as d:
+        async with open_db() as d:
+
             cur = await d.execute(
                 "SELECT id,total,currency,city,branch,receiver,phone,status,created_at FROM orders ORDER BY id DESC LIMIT 10"
             )
@@ -256,7 +261,8 @@ if dp_admin:
         if not command.args:
             return await m.answer("Формат: /order <id>")
         oid = int(command.args.strip())
-        async with await db() as d:
+        async with open_db() as d:
+
             cur = await d.execute("SELECT id,total,currency,city,branch,receiver,phone,status,created_at FROM orders WHERE id=?", (oid,))
             o = await cur.fetchone()
             if not o:
@@ -276,7 +282,8 @@ if dp_admin:
             oid = int(oid)
         except Exception:
             return await m.answer("Формат: /status <id> <new|paid|packed|shipped|done|cancelled>")
-        async with await db() as d:
+        async with open_db() as d:
+
             await d.execute("UPDATE orders SET status=? WHERE id=?", (new_status.strip(), oid))
             await d.commit()
         await m.answer(f"Статус заказа #{oid} → {new_status}")
@@ -288,14 +295,16 @@ if dp_admin:
             oid = int(oid)
         except Exception:
             return await m.answer("Формат: /ttn <id> <номер>")
-        async with await db() as d:
+        async with open_db() as d:
+
             await d.execute("UPDATE orders SET np_ttn=? WHERE id=?", (ttn.strip(), oid))
             await d.commit()
         await m.answer(f"TTN для заказа #{oid} сохранён.")
 
     @dp_admin.message(Command("products"))
     async def admin_products(m: Message):
-        async with await db() as d:
+        async with open_db() as d:
+
             cur = await d.execute("SELECT sku,title,price,currency,is_active FROM products ORDER BY title")
             rows = await cur.fetchall()
         if not rows:
@@ -317,7 +326,8 @@ if dp_admin:
             price = int(price)
         except:
             return await m.answer("Цена должна быть целым числом (в копейках/гривнах без копеек — как решишь).")
-        async with await db() as d:
+        async with open_db() as d:
+
             await d.execute("INSERT INTO products (sku,title,price,currency,is_active) VALUES (?,?,?,?,1) ON CONFLICT(sku) DO UPDATE SET title=excluded.title, price=excluded.price, currency=excluded.currency, is_active=1", (sku, title, price, currency))
             await d.commit()
         await m.answer(f"Товар [{sku}] добавлен/обновлён: {title} — {price} {currency}")
@@ -329,7 +339,8 @@ if dp_admin:
             price = int(price)
         except Exception:
             return await m.answer("Формат: /setprice <sku> <цена>")
-        async with await db() as d:
+        async with open_db() as d:
+
             await d.execute("UPDATE products SET price=? WHERE sku=?", (price, sku))
             await d.commit()
         await m.answer(f"Цена {sku} → {price}")
@@ -339,7 +350,8 @@ if dp_admin:
         if "|" not in (command.args or ""):
             return await m.answer("Формат: /settitle <sku> | <Новое название>")
         sku, title = [p.strip() for p in command.args.split("|", 1)]
-        async with await db() as d:
+        async with open_db() as d:
+
             await d.execute("UPDATE products SET title=? WHERE sku=?", (title, sku))
             await d.commit()
         await m.answer(f"Название {sku} → {title}")
@@ -349,7 +361,8 @@ if dp_admin:
         sku = (command.args or "").strip()
         if not sku:
             return await m.answer("Формат: /toggle <sku>")
-        async with await db() as d:
+        async with open_db() as d:
+
             cur = await d.execute("SELECT is_active FROM products WHERE sku=?", (sku,))
             row = await cur.fetchone()
             if not row:
