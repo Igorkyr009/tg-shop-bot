@@ -10,6 +10,54 @@ from aiogram.types import Message, WebAppInfo, MenuButtonWebApp
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 import aiosqlite
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup
+PAGE_SIZE = 6
+
+def fmt_price(p: int, cur: str) -> str:
+    return f"{p} {cur}"
+
+async def fetch_products(page: int = 0, category: str | None = None):
+    off = page * PAGE_SIZE
+    sql = "SELECT sku,title,price,currency,COALESCE(image_url,''),COALESCE(description,''),COALESCE(category,'') FROM products WHERE is_active=1"
+    params = []
+    if category:
+        sql += " AND category=?"
+        params.append(category)
+    sql += " ORDER BY title LIMIT ? OFFSET ?"
+    params.extend([PAGE_SIZE, off])
+    async with open_db() as d:
+        cur = await d.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        cur2 = await d.execute("SELECT COUNT(*) FROM products WHERE is_active=1" + (" AND category=?" if category else ""), ((category,) if category else ()))
+        (total,) = await cur2.fetchone()
+    return rows, total
+
+def catalog_keyboard(rows, page, total, category=None):
+    kb = InlineKeyboardBuilder()
+    for sku, title, price, cur, *_ in rows:
+        kb.button(text=f"{title} • {fmt_price(price, cur)}", callback_data=f"prod:view:{sku}")
+    nav = []
+    if page > 0:
+        nav.append(("« Назад", f"cat:page:{page-1}:{category or ''}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(("Вперёд »", f"cat:page:{page+1}:{category or ''}"))
+    if nav:
+        kb.adjust(1)
+        for text, cd in nav:
+            kb.button(text=text, callback_data=cd)
+    kb.adjust(1)
+    kb.button(text="🧺 Корзина", callback_data="cart:open")
+    return kb.as_markup()
+
+def product_keyboard(sku):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ В корзину", callback_data=f"cart:add:{sku}")
+    kb.button(text="🧺 Корзина", callback_data="cart:open")
+    kb.button(text="« К каталогу", callback_data="cat:page:0:")
+    kb.adjust(1)
+    return kb.as_markup()
 
 # ---------- ENV ----------
 load_dotenv()
@@ -30,6 +78,7 @@ dp_admin  = Dispatcher() if ADMIN_BOT_TOKEN else None
 
 # ---------- DB ----------
 CREATE_SQL = """
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -68,7 +117,36 @@ CREATE TABLE IF NOT EXISTS order_items (
   qty INTEGER NOT NULL,
   FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
 );
+
 """
+# новые поля и таблица корзины
+SCHEMA_ALTERS = [
+    ("products", "description", "TEXT"),
+    ("products", "image_url", "TEXT"),
+    ("products", "category", "TEXT"),
+]
+
+CREATE_CART_SQL = """
+CREATE TABLE IF NOT EXISTS cart_items (
+  user_id INTEGER NOT NULL,
+  sku TEXT NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (user_id, sku),
+  FOREIGN KEY (sku) REFERENCES products(sku) ON DELETE CASCADE
+);
+"""
+
+async def ensure_schema():
+    async with open_db() as d:
+        # добавить недостающие колонки в products
+        for table, col, typ in SCHEMA_ALTERS:
+            cur = await d.execute(f"PRAGMA table_info({table})")
+            cols = [r[1] for r in await cur.fetchall()]
+            if col not in cols:
+                await d.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        # создать корзину
+        await d.execute(CREATE_CART_SQL)
+        await d.commit()
 
 def open_db():
     return aiosqlite.connect(DB_PATH)  # возвращает контекст-менеджер
@@ -77,18 +155,9 @@ def open_db():
 async def init_db():
     async with open_db() as d:
         await d.executescript(CREATE_SQL)
-        # seed products, если пусто
-        cur = await d.execute("SELECT COUNT(*) FROM products")
-        (cnt,) = await cur.fetchone()
-        if cnt == 0:
-            await d.executemany(
-                "INSERT INTO products (sku,title,price,currency,is_active) VALUES (?,?,?,?,1)",
-                [
-                    ("coffee_1kg", "Кофе в зёрнах 1 кг", 1299, "UAH"),
-                    ("mug_brand",  "Кружка бренда",       299, "UAH"),
-                ],
-            )
         await d.commit()
+    await ensure_schema()
+
 
 # helpers settings
 async def set_setting(key:str, value:str):
@@ -133,6 +202,222 @@ async def shop_debug(m: Message):
 
 # Приём данных из WebApp
 @dp_shop.message(F.web_app_data)
+@dp_admin.message(Command("setimg"))
+async def admin_setimg(m: Message, command: CommandObject):
+    # /setimg <sku> <image_url>
+    try:
+        sku, url = command.args.split(maxsplit=1)
+    except Exception:
+        return await m.answer("Формат: /setimg <sku> <image_url>")
+    async with open_db() as d:
+        await d.execute("UPDATE products SET image_url=? WHERE sku=?", (url.strip(), sku.strip()))
+        await d.commit()
+    await m.answer(f"Картинка для {sku} обновлена.")
+
+@dp_admin.message(Command("setdesc"))
+async def admin_setdesc(m: Message, command: CommandObject):
+    # /setdesc <sku> | <Описание>
+    if "|" not in (command.args or ""):
+        return await m.answer("Формат: /setdesc <sku> | <Описание>")
+    sku, desc = [p.strip() for p in command.args.split("|", 1)]
+    async with open_db() as d:
+        await d.execute("UPDATE products SET description=? WHERE sku=?", (desc, sku))
+        await d.commit()
+    await m.answer(f"Описание {sku} обновлено.")
+
+@dp_admin.message(Command("setcat"))
+async def admin_setcat(m: Message, command: CommandObject):
+    # /setcat <sku> | <Категория>
+    if "|" not in (command.args or ""):
+        return await m.answer("Формат: /setcat <sku> | <Категория>")
+    sku, cat = [p.strip() for p in command.args.split("|", 1)]
+    async with open_db() as d:
+        await d.execute("UPDATE products SET category=? WHERE sku=?", (cat, sku))
+        await d.commit()
+    await m.answer(f"Категория {sku} → {cat}")
+@dp_shop.message(Command("catalog"))
+async def shop_catalog(m: Message):
+    rows, total = await fetch_products(page=0)
+    if not rows:
+        return await m.answer("Каталог пуст.")
+    await m.answer("Каталог:", reply_markup=catalog_keyboard(rows, 0, total))
+
+@dp_shop.callback_query(F.data.startswith("cat:page:"))
+async def cat_page(q: CallbackQuery):
+    _, _, page_str, category = q.data.split(":", 3)
+    page = int(page_str)
+    category = category or None
+    rows, total = await fetch_products(page=page, category=category)
+    try:
+        await q.message.edit_text("Каталог:", reply_markup=catalog_keyboard(rows, page, total, category))
+    except Exception:
+        await q.message.answer("Каталог:", reply_markup=catalog_keyboard(rows, page, total, category))
+    await q.answer()
+@dp_shop.callback_query(F.data.startswith("prod:view:"))
+async def prod_view(q: CallbackQuery):
+    sku = q.data.split(":", 2)[2]
+    async with open_db() as d:
+        cur = await d.execute("SELECT title,price,currency,COALESCE(image_url,''),COALESCE(description,'') FROM products WHERE sku=?", (sku,))
+        row = await cur.fetchone()
+    if not row:
+        await q.answer("Товар не найден", show_alert=True); return
+    title, price, cur, img, desc = row
+    caption = f"<b>{title}</b>\n{fmt_price(price, cur)}\n\n{desc or 'Описание будет скоро.'}"
+    try:
+        if img:
+            await q.message.answer_photo(photo=img, caption=caption, reply_markup=product_keyboard(sku))
+        else:
+            await q.message.answer(caption, reply_markup=product_keyboard(sku))
+    except Exception:
+        await q.message.answer(caption, reply_markup=product_keyboard(sku))
+    await q.answer()
+async def cart_summary(user_id: int):
+    async with open_db() as d:
+        cur = await d.execute("""
+          SELECT c.sku, p.title, p.price, p.currency, c.qty
+          FROM cart_items c
+          JOIN products p ON p.sku=c.sku
+          WHERE c.user_id=?
+        """, (user_id,))
+        items = await cur.fetchall()
+    total = sum(p * q for _, _, p, _, q in items)
+    currency = items[0][3] if items else "UAH"
+    return items, total, currency
+
+@dp_shop.callback_query(F.data.startswith("cart:add:"))
+async def cart_add(q: CallbackQuery):
+    sku = q.data.split(":", 2)[2]
+    async with open_db() as d:
+        # если товара нет/отключён — не добавляем
+        cur = await d.execute("SELECT 1 FROM products WHERE sku=? AND is_active=1", (sku,))
+        if not await cur.fetchone():
+            await q.answer("Товар недоступен", show_alert=True); return
+        await d.execute("INSERT INTO cart_items (user_id, sku, qty) VALUES (?,?,1) ON CONFLICT(user_id,sku) DO UPDATE SET qty=qty+1", (q.from_user.id, sku))
+        await d.commit()
+    items, total, curcy = await cart_summary(q.from_user.id)
+    await q.answer("Добавлено в корзину")
+    await q.message.answer(f"В корзине позиций: {len(items)} • Итого: {fmt_price(total, curcy)}", reply_markup=InlineKeyboardBuilder()
+                           .button(text="🧺 Открыть корзину", callback_data="cart:open")
+                           .as_markup())
+
+@dp_shop.message(Command("cart"))
+@dp_shop.callback_query(F.data == "cart:open")
+async def cart_open(ev):
+    user_id = ev.from_user.id if isinstance(ev, CallbackQuery) else ev.from_user.id
+    items, total, curcy = await cart_summary(user_id)
+    if not items:
+        text = "Корзина пуста."
+        rm = InlineKeyboardBuilder().button(text="« В каталог", callback_data="cat:page:0:").as_markup()
+    else:
+        lines = [f"• {t} × {q} = {p*q} {curcy}" for _, t, p, _, q in items]
+        text = "🧺 <b>Корзина</b>\n" + "\n".join(lines) + f"\n\nИтого: <b>{fmt_price(total, curcy)}</b>"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🧾 Оформить", callback_data="cart:checkout")
+        kb.button(text="🗑 Очистить", callback_data="cart:clear")
+        kb.button(text="« В каталог", callback_data="cat:page:0:")
+        kb.adjust(1)
+        rm = kb.as_markup()
+
+    if isinstance(ev, CallbackQuery):
+        await ev.message.answer(text, reply_markup=rm)
+        await ev.answer()
+    else:
+        await ev.answer(text, reply_markup=rm)
+
+@dp_shop.callback_query(F.data == "cart:clear")
+async def cart_clear(q: CallbackQuery):
+    async with open_db() as d:
+        await d.execute("DELETE FROM cart_items WHERE user_id=?", (q.from_user.id,))
+        await d.commit()
+    await q.answer("Корзина очищена")
+    await cart_open(q)
+class Checkout(StatesGroup):
+    city = State()
+    branch = State()
+    receiver = State()
+    phone = State()
+
+@dp_shop.callback_query(F.data == "cart:checkout")
+async def cart_checkout(q: CallbackQuery, state: FSMContext):
+    items, total, curcy = await cart_summary(q.from_user.id)
+    if not items:
+        await q.answer("Корзина пуста", show_alert=True); return
+    await state.set_state(Checkout.city)
+    await q.message.answer("Город (місто):")
+    await q.answer()
+
+@dp_shop.message(Checkout.city)
+async def ask_branch(m: Message, state: FSMContext):
+    await state.update_data(city=m.text.strip())
+    await state.set_state(Checkout.branch)
+    await m.answer("Отделение Новой Почты (відділення):")
+
+@dp_shop.message(Checkout.branch)
+async def ask_receiver(m: Message, state: FSMContext):
+    await state.update_data(branch=m.text.strip())
+    await state.set_state(Checkout.receiver)
+    await m.answer("ФИО получателя:")
+
+@dp_shop.message(Checkout.receiver)
+async def ask_phone(m: Message, state: FSMContext):
+    await state.update_data(receiver=m.text.strip())
+    await state.set_state(Checkout.phone)
+    await m.answer("Телефон (+380…):")
+
+@dp_shop.message(Checkout.phone)
+async def finish_checkout(m: Message, state: FSMContext):
+    data = await state.get_data()
+    phone = m.text.strip()
+    city, branch, receiver = data.get("city",""), data.get("branch",""), data.get("receiver","")
+
+    # собрать корзину
+    items, total, curcy = await cart_summary(m.from_user.id)
+    if not items:
+        await m.answer("Корзина пуста."); return
+
+    # сохранить заказ (как в on_webapp_data)
+    async with open_db() as d:
+        cur = await d.execute(
+            "INSERT INTO orders (tg_user_id,tg_username,tg_name,total,currency,city,branch,receiver,phone,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (m.from_user.id, f"@{m.from_user.username}" if m.from_user.username else None,
+             f"{m.from_user.first_name or ''} {m.from_user.last_name or ''}".strip(),
+             total, curcy, city, branch, receiver, phone, "new", int(time.time()))
+        )
+        await d.commit()
+        order_id = cur.lastrowid
+        for sku, title, price, _, qty in items:
+            await d.execute("INSERT INTO order_items (order_id,product_sku,product_title,price,qty) VALUES (?,?,?,?,?)",
+                            (order_id, sku, title, price, qty))
+        await d.execute("DELETE FROM cart_items WHERE user_id=?", (m.from_user.id,))
+        await d.commit()
+
+    await state.clear()
+
+    # подтверждение и уведомление админу
+    await m.answer(f"✅ Заказ #{order_id} создан! Мы свяжемся по доставке НП.")
+    items_txt = "\n".join([f"• {t} × {q} = {p*q} {curcy}" for _, t, p, _, q in items])
+    admin_msg = (
+        f"🆕 Новый заказ #{order_id}\n"
+        f"Покупатель: {m.from_user.first_name} {m.from_user.last_name or ''} "
+        f"({('@'+m.from_user.username) if m.from_user.username else '—'})\n"
+        f"ID: {m.from_user.id}\n"
+        f"{items_txt}\nИтого: {total} {curcy}\n"
+        f"Город: {city}\nОтделение: {branch}\n"
+        f"Получатель: {receiver} / {phone}"
+    )
+    await notify_admin(admin_msg)
+@dp_shop.message(Command("start"))
+async def cmd_start(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗂 Каталог", callback_data="cat:page:0:")
+    kb.button(text="🧺 Корзина", callback_data="cart:open")
+    if WEBAPP_URL:
+        kb.button(text="🛍 Витрина (WebApp)", web_app=WebAppInfo(url=WEBAPP_URL))
+    kb.adjust(1)
+    await m.answer("Добро пожаловать! Выберите действие:", reply_markup=kb.as_markup())
+
+
+
 async def on_webapp_data(m: Message):
     # ожидаем {"type":"checkout","items":[{"sku":"...","qty":1},...], "city":..., "branch":..., "receiver":..., "phone":...}
     try:
